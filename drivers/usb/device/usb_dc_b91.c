@@ -56,9 +56,10 @@ usbd_endpoint_index_e endpoint_in_idx[] = {USBD_IN_EP1_IDX, USBD_IN_EP2_IDX, USB
 
 usbd_endpoint_index_e endpoint_out_idx[] = {USBD_OUT_EP5_IDX, USBD_OUT_EP6_IDX};
 
-#define USBD_EPIN_CNT  (sizeof(endpoint_in_idx) / sizeof(usbd_endpoint_index_e))
-#define USBD_EPOUT_CNT (sizeof(endpoint_out_idx) / sizeof(usbd_endpoint_index_e))
-#define USBD_EP_CNT    (USBD_EPIN_CNT + USBD_EPOUT_CNT)
+#define USBD_EPIN_CNT	   (sizeof(endpoint_in_idx) / sizeof(usbd_endpoint_index_e))
+#define USBD_EPOUT_CNT	   (sizeof(endpoint_out_idx) / sizeof(usbd_endpoint_index_e))
+#define USBD_EP_IN_OUT_CNT (USBD_EPIN_CNT + USBD_EPOUT_CNT)
+#define USBD_EP_TOTAL_CNT  (USBD_EP_IN_OUT_CNT + 1)
 
 /** @brief The value of direction bit for the IN endpoint direction. */
 #define USBD_EP_DIR_IN (1U << 7)
@@ -90,7 +91,7 @@ usbd_endpoint_index_e endpoint_out_idx[] = {USBD_OUT_EP5_IDX, USBD_OUT_EP6_IDX};
 
 #define EP_DATA_BUF_LEN 512
 
-/* Endpoints hardware buffer size */
+/* The total hardware buffer size */
 #define EPS_BUFFER_TOTAL_SIZE 256
 
 /**
@@ -102,7 +103,7 @@ usbd_endpoint_index_e endpoint_out_idx[] = {USBD_OUT_EP5_IDX, USBD_OUT_EP6_IDX};
  * @param remaining_size	The remaining available size of the USB endpoint cache.
  */
 typedef struct {
-	usbd_endpoint_index_e init_list[9];
+	usbd_endpoint_index_e init_list[USBD_EP_TOTAL_CNT];
 	uint8_t seg_addr;
 	uint8_t init_num;
 	uint16_t remaining_size;
@@ -183,15 +184,15 @@ struct b91_usbd_ctx {
 	bool suspend;
 	struct k_work usb_work;
 	struct k_mutex drv_lock;
-	struct b91_usbd_ep_ctx ep_ctx[9];
+	struct b91_usbd_ep_ctx ep_ctx[USBD_EP_TOTAL_CNT];
 };
 
 #define USB_FIFO_NUM  10
 #define USB_FIFO_SIZE 8
 
-static unsigned char usb_fifo[USB_FIFO_NUM][USB_FIFO_SIZE];
-static unsigned char usb_ff_rptr = 0;
-unsigned char usb_ff_wptr = 0;
+static uint8_t usb_fifo[USB_FIFO_NUM][USB_FIFO_SIZE];
+static uint8_t usb_ff_rptr = 0;
+static uint8_t usb_ff_wptr = 0;
 
 static struct b91_usbd_ctx usbd_ctx = {
 	.irq_in_ep_bits = 0,
@@ -219,8 +220,8 @@ static inline bool ep_is_valid(const uint8_t ep)
 {
 	uint8_t ep_idx = USB_EP_GET_IDX(ep);
 
-	if (ep_idx > USBD_EP_CNT) {
-		LOG_ERR("Endpoit index %d is out of range %d.", ep_idx, USBD_EP_CNT);
+	if (ep_idx > USBD_EP_IN_OUT_CNT) {
+		LOG_ERR("Endpoit index %d is out of range.", ep_idx);
 		return false;
 	}
 
@@ -314,7 +315,7 @@ struct usbd_event {
 };
 
 #define FIFO_ELEM_SZ	sizeof(struct usbd_event)
-#define FIFO_ELEM_ALIGN sizeof(unsigned int)
+#define FIFO_ELEM_ALIGN sizeof(uint32_t)
 
 K_MEM_SLAB_DEFINE(fifo_elem_slab, FIFO_ELEM_SZ, CONFIG_USB_B91_EVT_QUEUE_SIZE, FIFO_ELEM_ALIGN);
 
@@ -400,38 +401,6 @@ static inline struct usbd_event *usbd_evt_alloc(void)
 	return ev;
 }
 
-static void submit_irq_suspend_event(void)
-{
-	struct usbd_event *ev = usbd_evt_alloc();
-	if (!ev) {
-		return;
-	}
-
-	ev->evt_type = USBD_EVT_SUSPEND;
-	usbd_evt_put(ev);
-
-	if (usbd_ctx.attached) {
-		usbd_work_schedule();
-	}
-}
-
-#if (IS_ENABLED(CONFIG_USB_B91_SUSPEND))
-static void submit_mcu_sleep_event(void)
-{
-	struct usbd_event *ev = usbd_evt_alloc();
-	if (!ev) {
-		return;
-	}
-
-	ev->evt_type = USBD_EVT_SLEEP;
-	usbd_evt_put(ev);
-
-	if (usbd_ctx.attached) {
-		usbd_work_schedule();
-	}
-}
-#endif
-
 static void submit_usbd_event(enum usbd_event_type evt_type)
 {
 	struct usbd_event *ev = usbd_evt_alloc();
@@ -510,15 +479,14 @@ static int ep_write(uint8_t ep, uint8_t *data, uint32_t data_len)
 	} else {
 		if (usbhw_is_ep_busy(ep_idx)) {
 			LOG_DBG("EP%d is BUSY.", ep_idx);
-			unsigned char *pData =
-				(unsigned char *)&usb_fifo[usb_ff_wptr++ & (USB_FIFO_NUM - 1)];
-			pData[0] = ep;
-			pData[1] = data_len;
-			memcpy(pData + 2, data, data_len);
+			uint8_t *p = (uint8_t *)&usb_fifo[usb_ff_wptr++ & (USB_FIFO_NUM - 1)];
+			p[0] = ep;           // endpoint index
+			p[1] = data_len;     // data length 
+			memcpy(p + 2, data, data_len);
 
 			int fifo_use = (usb_ff_wptr - usb_ff_rptr) & (USB_FIFO_NUM * 2 - 1);
 			if (fifo_use > USB_FIFO_NUM) {
-				usb_ff_rptr++; // fifo overflow, overlap older data
+				usb_ff_rptr++; // fifo overflows
 			}
 			k_mutex_unlock(&ctx->drv_lock);
 			submit_usbd_event(USBD_EVT_FF);
@@ -548,14 +516,14 @@ static void usb_fifo_proc(void)
 		return;
 	}
 
-	unsigned char *pData = (unsigned char *)&usb_fifo[usb_ff_rptr & (USB_FIFO_NUM - 1)];
+	uint8_t *p = (uint8_t *)&usb_fifo[usb_ff_rptr & (USB_FIFO_NUM - 1)];
 
-	if (usbhw_is_ep_busy(pData[0])) {
-		LOG_DBG("EP%d is BUSY.", USB_EP_GET_IDX(pData[0]));
+	if (usbhw_is_ep_busy(p[0])) {
+		LOG_DBG("EP%d is BUSY.", USB_EP_GET_IDX(p[0]));
 		submit_usbd_event(USBD_EVT_FF);
 		return;
 	} else {
-		ep_write(pData[0], &pData[2], pData[1]);
+		ep_write(p[0], &p[2], p[1]);
 		usb_ff_rptr++;
 	}
 	return;
@@ -673,7 +641,7 @@ static int usb_irq_suspend_handler(void)
 		}
 #if (IS_ENABLED(CONFIG_USB_B91_SUSPEND))
 		/* enter suspend */
-		submit_usbd_event(USBD_EVT_SUSPEND);
+		submit_usbd_event(USBD_EVT_SLEEP);
 #endif
 	}
 	return 0;
@@ -760,7 +728,7 @@ static void usb_irq_suspend(void)
 	usbhw_clr_irq_status(USB_IRQ_SUSPEND_STATUS);
 	if (!get_usbd_ctx()->suspend) {
 		get_usbd_ctx()->suspend = true;
-		submit_irq_suspend_event();
+		submit_usbd_event(USBD_EVT_SUSPEND);
 	}
 }
 
@@ -785,7 +753,7 @@ int usb_dc_attach(void)
 
 	k_mutex_init(&ctx->drv_lock);
 
-	for (i = USBD_IN_EP1_IDX; i <= USBD_EP_CNT; i++) {
+	for (i = USBD_IN_EP1_IDX; i <= USBD_EP_IN_OUT_CNT; i++) {
 		if ((i == USBD_OUT_EP5_IDX) || (i == USBD_OUT_EP6_IDX)) {
 			ep_ctx = out_endpoint_ctx(i);
 		} else {
@@ -874,7 +842,7 @@ int usb_dc_detach(void)
 
 	k_mutex_lock(&ctx->drv_lock, K_FOREVER);
 
-	for (i = USBD_IN_EP1_IDX; i <= USBD_EP_CNT; i++) {
+	for (i = USBD_IN_EP1_IDX; i <= USBD_EP_IN_OUT_CNT; i++) {
 		if ((i == USBD_OUT_EP5_IDX) || (i == USBD_OUT_EP6_IDX)) {
 			ep_ctx = out_endpoint_ctx(i);
 		} else {
@@ -966,7 +934,7 @@ int usb_dc_ep_check_cap(const struct usb_dc_ep_cfg_data *const ep_cfg)
 	LOG_INF("ep 0x%02x, mps %d, type %d", ep_cfg->ep_addr, ep_cfg->ep_mps, ep_cfg->ep_type);
 
 	if (ep_idx > USBD_IN_EP8_IDX) {
-		LOG_ERR("Endpoint index %d is out of range %d.", ep_idx, USBD_IN_EP8_IDX);
+		LOG_ERR("Endpoint index %d is out of range.", ep_idx);
 		return -EINVAL;
 	}
 
