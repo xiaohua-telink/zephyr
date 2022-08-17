@@ -480,8 +480,8 @@ static int ep_write(uint8_t ep, uint8_t *data, uint32_t data_len)
 		if (usbhw_is_ep_busy(ep_idx)) {
 			LOG_DBG("EP%d is BUSY.", ep_idx);
 			uint8_t *p = (uint8_t *)&usb_fifo[usb_ff_wptr++ & (USB_FIFO_NUM - 1)];
-			p[0] = ep;           // endpoint index
-			p[1] = data_len;     // data length 
+			p[0] = ep;	 // endpoint address
+			p[1] = data_len; // data length
 			memcpy(p + 2, data, data_len);
 
 			int fifo_use = (usb_ff_wptr - usb_ff_rptr) & (USB_FIFO_NUM * 2 - 1);
@@ -492,17 +492,14 @@ static int ep_write(uint8_t ep, uint8_t *data, uint32_t data_len)
 			submit_usbd_event(USBD_EVT_FF);
 			return 0;
 		}
-		if (ep_ctx->cfg.type == USB_DC_EP_BULK) {
-			usbhw_write_ep(ep_idx, w_data, data_len);
-		} else {
-			reg_usb_ep_ptr(ep_idx) = 0;
-			for (i = 0; i < data_len; i++) {
-				reg_usb_ep_dat(ep_idx) = *w_data++;
-			}
-			reg_usb_ep_ctrl(ep_idx) =
-				FLD_EP_DAT_ACK |
-				(ep_ctx->edp_toggle ? FLD_USB_EP_DAT1 : FLD_USB_EP_DAT0);
-			ep_ctx->edp_toggle ^= 1;
+		 
+		usbhw_reset_ep_ptr(ep_idx);
+		for (i = 0; i < data_len; i++) {
+			reg_usb_ep_dat(ep_idx) = w_data[i];
+		}
+		usbhw_data_ep_ack(ep_idx);
+		if (ep_ctx->cfg.cb) {
+			ep_ctx->cfg.cb(ep_ctx->cfg.addr, USB_DC_EP_DATA_IN);
 		}
 	}
 
@@ -703,6 +700,7 @@ static void irq_in_eps_handler(uint8_t in_eps)
 		usbhw_reset_ep_ptr(USBD_IN_EP8_IDX);
 	}
 }
+
 static void usb_irq_eps(void)
 {
 	uint8_t irq_eps;
