@@ -59,7 +59,7 @@ USBD_DEVICE_DESCR_DEFINE(primary) struct common_descriptor common_desc = {
 #ifdef CONFIG_USB_DEVICE_BOS
 		.bcdUSB = sys_cpu_to_le16(USB_SRN_2_1),
 #else
-		.bcdUSB = sys_cpu_to_le16(USB_SRN_1_1),
+		.bcdUSB = sys_cpu_to_le16(USB_SRN_2_0),
 #endif
 #ifdef CONFIG_USB_COMPOSITE_DEVICE
 		.bDeviceClass = USB_BCC_MISCELLANEOUS,
