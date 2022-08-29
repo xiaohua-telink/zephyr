@@ -29,6 +29,11 @@ LOG_MODULE_REGISTER(usb_b91);
 #define USBD_B91_IRQN_BY_IDX(idx)	  DT_INST_IRQ_BY_IDX(0, idx, irq)
 #define USBD_B91_IRQ_PRIORITY_BY_IDX(idx) DT_INST_IRQ_BY_IDX(0, idx, priority)
 
+#define IS_REQUESTTYPE_DEV_TO_HOST(bmRT) (bmRT & 0x80)
+
+#define CTRL_EP_NORMAL_PACKET_REG_VALUE 0x38
+#define CTRL_EP_ZLP_REG_VALUE		0x18
+
 static const uint8_t ep_en_bit[] = {0,
 				    FLD_USB_EDP1_EN,
 				    FLD_USB_EDP2_EN,
@@ -38,6 +43,11 @@ static const uint8_t ep_en_bit[] = {0,
 				    FLD_USB_EDP6_EN,
 				    FLD_USB_EDP7_EN,
 				    FLD_USB_EDP8_EN};
+
+#define USB_IN_EDP_IRQ_BITS                                                                        \
+	(FLD_USB_EDP1_IRQ | FLD_USB_EDP2_IRQ | FLD_USB_EDP3_IRQ | FLD_USB_EDP4_IRQ |               \
+	 FLD_USB_EDP7_IRQ | FLD_USB_EDP8_IRQ)
+#define USB_OUT_EDP_IRQ_BITS (FLD_USB_EDP5_IRQ | FLD_USB_EDP6_IRQ)
 
 typedef enum {
 	USBD_EP0_IDX = 0,     // only for control transfer
@@ -135,19 +145,18 @@ struct b91_usbd_ep_cfg {
 /**
  * @brief Endpoint buffer
  *
- * @param total_len	Total length to be read/written.
- * @param left_len	Left length to be read/written.
- * @param this_len	Length of this time to be read/written.
- * @param len		Remaining length to be read/written.
- * @param data		Data buffer for the endpoint.
- * @param curr		Pointer to the current offset in the endpoint buffer.
+ * @param total_len		Total length to be read/written.
+ * @param left_len		Remaining length to be read/written.
+ * @param current_len	Length of this time to be read/written.
+ * @param data			Data buffer for the endpoint.
+ * @param current_pos	Pointer to the current offset in the endpoint buffer.
  */
 struct b91_usbd_ep_buf {
 	uint32_t total_len;
 	uint32_t left_len;
-	uint32_t this_len;
+	uint32_t current_len;
 	uint8_t data[EP_DATA_BUF_LEN];
-	uint8_t *curr;
+	uint8_t *current_pos;
 };
 
 /**
@@ -159,7 +168,8 @@ struct b91_usbd_ep_buf {
 struct b91_usbd_ep_ctx {
 	struct b91_usbd_ep_cfg cfg;
 	struct b91_usbd_ep_buf buf;
-	uint8_t edp_toggle;
+	bool reading;
+	uint8_t writing_len;
 };
 
 /**
@@ -167,7 +177,6 @@ struct b91_usbd_ep_ctx {
  *
  * @param status_cb			Status callback for USB DC notifications
  * @param setup				Setup packet for Control requests
- * @param irq_in_ep_bits	interrupt transfer input endpoint
  * @param attached			USBD Attached flag
  * @param ready				USBD Ready flag set after pullup
  * @param suspend			Suspend flag
@@ -178,7 +187,6 @@ struct b91_usbd_ep_ctx {
 struct b91_usbd_ctx {
 	usb_dc_status_callback status_cb;
 	struct usb_setup_packet setup;
-	uint8_t irq_in_ep_bits;
 	bool attached;
 	bool ready;
 	bool suspend;
@@ -188,14 +196,13 @@ struct b91_usbd_ctx {
 };
 
 #define USB_FIFO_NUM  10
-#define USB_FIFO_SIZE 8
+#define USB_FIFO_SIZE 128
 
 static uint8_t usb_fifo[USB_FIFO_NUM][USB_FIFO_SIZE];
 static uint8_t usb_ff_rptr = 0;
 static uint8_t usb_ff_wptr = 0;
 
 static struct b91_usbd_ctx usbd_ctx = {
-	.irq_in_ep_bits = 0,
 	.attached = false,
 	.ready = false,
 	.suspend = true,
@@ -293,7 +300,8 @@ enum usbd_ep_event_type {
 };
 
 enum usbd_event_type {
-	USBD_EVT_EP,
+	USBD_EVT_IRQ_EP,
+	USBD_EVT_EP_COMPLETE,
 	USBD_EVT_REINIT,
 	USBD_EVT_SETUP,
 	USBD_EVT_DATA,
@@ -312,6 +320,8 @@ struct usbd_event {
 	sys_snode_t node;
 	struct usbd_mem_block block;
 	enum usbd_event_type evt_type;
+	uint8_t ep_bits;
+	uint8_t ep_idx;
 };
 
 #define FIFO_ELEM_SZ	sizeof(struct usbd_event)
@@ -401,7 +411,7 @@ static inline struct usbd_event *usbd_evt_alloc(void)
 	return ev;
 }
 
-static void submit_usbd_event(enum usbd_event_type evt_type)
+static void submit_usbd_event(enum usbd_event_type evt_type, uint8_t value)
 {
 	struct usbd_event *ev = usbd_evt_alloc();
 	if (!ev) {
@@ -410,6 +420,11 @@ static void submit_usbd_event(enum usbd_event_type evt_type)
 
 	ev->evt_type = evt_type;
 
+	if (ev->evt_type == USBD_EVT_IRQ_EP) {
+		ev->ep_bits = value;
+	} else if (ev->evt_type == USBD_EVT_EP_COMPLETE) {
+		ev->ep_idx = value;
+	}
 	usbd_evt_put(ev);
 
 	if (usbd_ctx.attached) {
@@ -433,16 +448,18 @@ static void ep_ctx_reset(struct b91_usbd_ep_ctx *ep_ctx)
 	} else {
 		reg_usb_ep_ptr(ep_idx) = 0;
 	}
-	ep_ctx->buf.curr = ep_ctx->buf.data;
+	ep_ctx->buf.current_pos = ep_ctx->buf.data;
 	ep_ctx->buf.total_len = 0;
 	ep_ctx->buf.left_len = 0;
+	ep_ctx->reading = false;
+	ep_ctx->writing_len = 0;
 }
 
 static void ep_buf_clear(uint8_t ep)
 {
 	struct b91_usbd_ep_ctx *ep_ctx = endpoint_ctx(ep);
 
-	ep_ctx->buf.curr = ep_ctx->buf.data;
+	ep_ctx->buf.current_pos = ep_ctx->buf.data;
 	ep_ctx->buf.total_len = 0;
 	ep_ctx->buf.left_len = 0;
 }
@@ -467,9 +484,9 @@ static int ep_write(uint8_t ep, uint8_t *data, uint32_t data_len)
 		} else {
 			w_data_len = data_len;
 		}
-		ep_ctx->buf.this_len = w_data_len;
-		ep_ctx->buf.curr += ep_ctx->buf.this_len;
-		ep_ctx->buf.left_len -= ep_ctx->buf.this_len;
+		ep_ctx->buf.current_len = w_data_len;
+		ep_ctx->buf.current_pos += ep_ctx->buf.current_len;
+		ep_ctx->buf.left_len -= ep_ctx->buf.current_len;
 
 		usbhw_reset_ctrl_ep_ptr();
 		while (w_data_len-- > 0) {
@@ -489,18 +506,17 @@ static int ep_write(uint8_t ep, uint8_t *data, uint32_t data_len)
 				usb_ff_rptr++; // fifo overflows
 			}
 			k_mutex_unlock(&ctx->drv_lock);
-			submit_usbd_event(USBD_EVT_FF);
+			submit_usbd_event(USBD_EVT_FF, 0);
 			return 0;
 		}
-		 
+
 		usbhw_reset_ep_ptr(ep_idx);
 		for (i = 0; i < data_len; i++) {
 			reg_usb_ep_dat(ep_idx) = w_data[i];
 		}
+		ep_ctx->writing_len = data_len;
 		usbhw_data_ep_ack(ep_idx);
-		if (ep_ctx->cfg.cb) {
-			ep_ctx->cfg.cb(ep_ctx->cfg.addr, USB_DC_EP_DATA_IN);
-		}
+		submit_usbd_event(USBD_EVT_EP_COMPLETE, ep_idx);
 	}
 
 	k_mutex_unlock(&ctx->drv_lock);
@@ -517,7 +533,7 @@ static void usb_fifo_proc(void)
 
 	if (usbhw_is_ep_busy(p[0])) {
 		LOG_DBG("EP%d is BUSY.", USB_EP_GET_IDX(p[0]));
-		submit_usbd_event(USBD_EVT_FF);
+		submit_usbd_event(USBD_EVT_FF, 0);
 		return;
 	} else {
 		ep_write(p[0], &p[2], p[1]);
@@ -526,13 +542,13 @@ static void usb_fifo_proc(void)
 	return;
 }
 
-static int usb_irq_setup_handler(void)
+static void usb_irq_setup_handler(void)
 {
 	struct b91_usbd_ep_ctx *ep_ctx;
 	struct b91_usbd_ctx *ctx = get_usbd_ctx();
 
 	memset(&ctx->setup, 0, sizeof(struct usb_setup_packet));
-	reg_usb_sups_cyc_cali = 0x38;
+	reg_usb_sups_cyc_cali = CTRL_EP_NORMAL_PACKET_REG_VALUE;
 	usbhw_reset_ctrl_ep_ptr();
 	ctx->setup.bmRequestType = usbhw_read_ctrl_ep_data();
 	ctx->setup.bRequest = usbhw_read_ctrl_ep_data();
@@ -540,8 +556,8 @@ static int usb_irq_setup_handler(void)
 	ctx->setup.wIndex = usbhw_read_ctrl_ep_u16();
 	ctx->setup.wLength = usbhw_read_ctrl_ep_u16();
 
-	LOG_INF("SETUP: bR:0x%02x bmRT:0x%02x wV:0x%04x wI:0x%04x wL:%d",
-		(uint32_t)ctx->setup.bRequest, (uint32_t)ctx->setup.bmRequestType,
+	LOG_DBG("SETUP:bmRT:0x%02x  bR:0x%02x wV:0x%04x wI:0x%04x wL:%d",
+		(uint32_t)ctx->setup.bmRequestType, (uint32_t)ctx->setup.bRequest,
 		(uint32_t)ctx->setup.wValue, (uint32_t)ctx->setup.wIndex,
 		(uint32_t)ctx->setup.wLength);
 
@@ -555,45 +571,94 @@ static int usb_irq_setup_handler(void)
 	} else {
 		usbhw_write_ctrl_ep_ctrl(FLD_EP_DAT_ACK);
 	}
-	return 0;
+
+	if (!IS_REQUESTTYPE_DEV_TO_HOST(ctx->setup.bmRequestType) && ctx->setup.wLength) {
+		ep_ctx->reading = true;
+		ep_ctx->buf.left_len = ctx->setup.wLength;
+		ep_ctx->buf.total_len = ctx->setup.wLength;
+		ep_ctx->buf.current_pos = ep_ctx->buf.data;
+	}
 }
 
-static int usb_irq_data_handler(void)
+static void usb_ctrl_data_read_handler(void)
+{
+	struct b91_usbd_ep_ctx *ep_ctx =
+		endpoint_ctx(USB_EP_GET_ADDR(USBD_EP0_IDX, USB_EP_DIR_OUT));
+	uint32_t i = 0;
+	uint32_t len = 0;
+
+	if (!ep_ctx->reading) {
+		return;
+	}
+	if (ep_ctx->buf.left_len > 8) {
+		len = 8;
+		ep_ctx->buf.left_len -= 8;
+	} else {
+		len = ep_ctx->buf.left_len;
+		ep_ctx->buf.left_len = 0;
+	}
+
+	usbhw_reset_ctrl_ep_ptr();
+	for (i = 0; i < len; i++) {
+		ep_ctx->buf.current_pos[i] = usbhw_read_ctrl_ep_data();
+	}
+	ep_ctx->buf.current_pos += len;
+
+	usbhw_write_ctrl_ep_ctrl(FLD_EP_DAT_ACK);
+	if (!ep_ctx->buf.left_len) {
+		LOG_HEXDUMP_DBG(ep_ctx->buf.data, ep_ctx->buf.total_len, "");
+		if (ep_ctx->cfg.cb) {
+			ep_ctx->cfg.cb(USB_EP_GET_ADDR(USBD_EP0_IDX, USB_EP_DIR_OUT),
+				       USB_DC_EP_DATA_OUT);
+		}
+	}
+}
+
+static void usb_ctrl_data_write_handler(void)
 {
 	struct b91_usbd_ctx *ctx = get_usbd_ctx();
 	struct b91_usbd_ep_ctx *ep_ctx = endpoint_ctx(0);
 
-	if ((ep_ctx->buf.total_len % 8 != 0) && !ep_ctx->buf.left_len) {
-		return 0;
-	}
-	reg_usb_sups_cyc_cali = 0x38;
+	reg_usb_sups_cyc_cali = CTRL_EP_NORMAL_PACKET_REG_VALUE;
 	usbhw_reset_ctrl_ep_ptr();
-	ep_write(USB_EP_GET_ADDR(USBD_EP0_IDX, USB_EP_DIR_OUT), ep_ctx->buf.curr,
+	ep_write(USB_EP_GET_ADDR(USBD_EP0_IDX, USB_EP_DIR_OUT), ep_ctx->buf.current_pos,
 		 ep_ctx->buf.left_len);
 
 	if (ep_ctx->cfg.stall) {
 		usbhw_write_ctrl_ep_ctrl(FLD_EP_DAT_STALL);
 	} else {
-		if ((ep_ctx->buf.total_len % 8 == 0) && (ep_ctx->buf.this_len == 0) &&
+		if ((ep_ctx->buf.total_len % 8 == 0) && (ep_ctx->buf.current_len == 0) &&
 		    (ep_ctx->buf.total_len != ctx->setup.wLength)) {
-			reg_usb_sups_cyc_cali = 0x18;
+			reg_usb_sups_cyc_cali = CTRL_EP_ZLP_REG_VALUE;
 		}
 		usbhw_write_ctrl_ep_ctrl(FLD_EP_DAT_ACK);
 	}
-
-	return 0;
 }
 
-static int usb_irq_status_handler(void)
+static void usb_irq_data_handler(void)
 {
-	reg_usb_sups_cyc_cali = 0x38;
+	struct b91_usbd_ctx *ctx = get_usbd_ctx();
+	struct b91_usbd_ep_ctx *ep_ctx = endpoint_ctx(0);
+
+	if (!IS_REQUESTTYPE_DEV_TO_HOST(ctx->setup.bmRequestType)) {
+		usb_ctrl_data_read_handler();
+		return;
+	}
+
+	if ((ep_ctx->buf.total_len % 8 != 0) && !ep_ctx->buf.left_len) {
+		return;
+	}
+	usb_ctrl_data_write_handler();
+}
+
+static void usb_irq_status_handler(void)
+{
+	reg_usb_sups_cyc_cali = CTRL_EP_NORMAL_PACKET_REG_VALUE;
 	if (endpoint_ctx(0)->cfg.stall) {
 		usbhw_write_ctrl_ep_ctrl(FLD_EP_STA_STALL);
 	} else {
 		usbhw_write_ctrl_ep_ctrl(FLD_EP_STA_ACK);
 	}
-
-	return 0;
 }
 
 static int usb_irq_reset_handler(void)
@@ -604,7 +669,6 @@ static int usb_irq_reset_handler(void)
 	for (i = 1; i <= 8; i++) {
 		reg_usb_ep_ctrl(i) = 0;
 		ep_ctx = &get_usbd_ctx()->ep_ctx[i];
-		ep_ctx->edp_toggle = 0;
 	}
 
 	if (get_usbd_ctx()->suspend) {
@@ -638,7 +702,7 @@ static int usb_irq_suspend_handler(void)
 		}
 #if (IS_ENABLED(CONFIG_USB_B91_SUSPEND))
 		/* enter suspend */
-		submit_usbd_event(USBD_EVT_SLEEP);
+		submit_usbd_event(USBD_EVT_SLEEP, 0);
 #endif
 	}
 	return 0;
@@ -654,19 +718,31 @@ static void mcu_enter_suspend(void)
 static void usb_irq_setup(void)
 {
 	usbhw_clr_ctrl_ep_irq(FLD_CTRL_EP_IRQ_SETUP);
-	submit_usbd_event(USBD_EVT_SETUP);
+	submit_usbd_event(USBD_EVT_SETUP, 0);
 }
 
 static void usb_irq_data(void)
 {
 	usbhw_clr_ctrl_ep_irq(FLD_CTRL_EP_IRQ_DATA);
-	submit_usbd_event(USBD_EVT_DATA);
+	submit_usbd_event(USBD_EVT_DATA, 0);
 }
 
 static void usb_irq_status(void)
 {
 	usbhw_clr_ctrl_ep_irq(FLD_CTRL_EP_IRQ_STA);
-	submit_usbd_event(USBD_EVT_STATUS);
+	submit_usbd_event(USBD_EVT_STATUS, 0);
+}
+
+static inline void usb_ep_send_zlp_if_needed(const uint8_t ep_idx)
+{
+	struct b91_usbd_ep_ctx *ep_ctx;
+
+	ep_ctx = in_endpoint_ctx(ep_idx);
+	if ((ep_ctx != NULL) && (ep_ctx->cfg.max_sz == ep_ctx->writing_len)) {
+		ep_ctx->writing_len = 0;
+		usbhw_reset_ep_ptr(ep_idx);
+		usbhw_data_ep_ack(ep_idx);
+	}
 }
 
 static void irq_in_eps_handler(uint8_t in_eps)
@@ -674,50 +750,63 @@ static void irq_in_eps_handler(uint8_t in_eps)
 	if (!in_eps) {
 		return;
 	}
+
 	LOG_DBG("in_eps: 0x%02X", in_eps);
 	if (in_eps & FLD_USB_EDP1_IRQ) {
 		usbhw_clr_eps_irq(FLD_USB_EDP1_IRQ);
 		usbhw_reset_ep_ptr(USBD_IN_EP1_IDX);
+		usb_ep_send_zlp_if_needed(USBD_IN_EP1_IDX);
 	}
 	if (in_eps & FLD_USB_EDP2_IRQ) {
 		usbhw_clr_eps_irq(FLD_USB_EDP2_IRQ);
 		usbhw_reset_ep_ptr(USBD_IN_EP2_IDX);
+		usb_ep_send_zlp_if_needed(USBD_IN_EP2_IDX);
 	}
 	if (in_eps & FLD_USB_EDP3_IRQ) {
 		usbhw_clr_eps_irq(FLD_USB_EDP3_IRQ);
 		usbhw_reset_ep_ptr(USBD_IN_EP3_IDX);
+		usb_ep_send_zlp_if_needed(USBD_IN_EP3_IDX);
 	}
 	if (in_eps & FLD_USB_EDP4_IRQ) {
 		usbhw_clr_eps_irq(FLD_USB_EDP4_IRQ);
 		usbhw_reset_ep_ptr(USBD_IN_EP4_IDX);
+		usb_ep_send_zlp_if_needed(USBD_IN_EP4_IDX);
 	}
 	if (in_eps & FLD_USB_EDP7_IRQ) {
 		usbhw_clr_eps_irq(FLD_USB_EDP7_IRQ);
 		usbhw_reset_ep_ptr(USBD_IN_EP7_IDX);
+		usb_ep_send_zlp_if_needed(USBD_IN_EP7_IDX);
 	}
 	if (in_eps & FLD_USB_EDP8_IRQ) {
 		usbhw_clr_eps_irq(FLD_USB_EDP8_IRQ);
 		usbhw_reset_ep_ptr(USBD_IN_EP8_IDX);
+		usb_ep_send_zlp_if_needed(USBD_IN_EP8_IDX);
 	}
+}
+
+static void irq_out_eps_handler(uint8_t out_eps)
+{
+	if (!out_eps) {
+		return;
+	}
+
+	LOG_DBG("out_eps: 0x%02X", out_eps);
+	usbhw_clr_eps_irq(out_eps);
+	submit_usbd_event(USBD_EVT_IRQ_EP, out_eps);
 }
 
 static void usb_irq_eps(void)
 {
-	uint8_t irq_eps;
+	uint8_t irq_eps = usbhw_get_eps_irq();
 
-	irq_eps = usbhw_get_eps_irq();
-	usbhw_clr_eps_irq(irq_eps);
-	irq_in_eps_handler(irq_eps & get_usbd_ctx()->irq_in_ep_bits);
-
-	if (irq_eps ^ get_usbd_ctx()->irq_in_ep_bits) {
-		submit_usbd_event(USBD_EVT_EP);
-	}
+	irq_in_eps_handler(irq_eps & USB_IN_EDP_IRQ_BITS);
+	irq_out_eps_handler(irq_eps & USB_OUT_EDP_IRQ_BITS);
 }
 
 static void usb_irq_reset(void)
 {
 	usbhw_clr_irq_status(USB_IRQ_RESET_STATUS);
-	submit_usbd_event(USBD_EVT_RESET);
+	submit_usbd_event(USBD_EVT_RESET, 0);
 }
 
 static void usb_irq_suspend(void)
@@ -726,7 +815,7 @@ static void usb_irq_suspend(void)
 	usbhw_clr_irq_status(USB_IRQ_SUSPEND_STATUS);
 	if (!get_usbd_ctx()->suspend) {
 		get_usbd_ctx()->suspend = true;
-		submit_usbd_event(USBD_EVT_SUSPEND);
+		submit_usbd_event(USBD_EVT_SUSPEND, 0);
 	}
 }
 
@@ -848,7 +937,6 @@ int usb_dc_detach(void)
 		}
 		memset(ep_ctx, 0, sizeof(*ep_ctx));
 	}
-	get_usbd_ctx()->irq_in_ep_bits = 0;
 	ctx->attached = false;
 	k_mutex_unlock(&ctx->drv_lock);
 
@@ -929,7 +1017,7 @@ int usb_dc_ep_check_cap(const struct usb_dc_ep_cfg_data *const ep_cfg)
 {
 	uint8_t ep_idx = USB_EP_GET_IDX(ep_cfg->ep_addr);
 
-	LOG_INF("ep 0x%02x, mps %d, type %d", ep_cfg->ep_addr, ep_cfg->ep_mps, ep_cfg->ep_type);
+	LOG_DBG("ep 0x%02x, mps %d, type %d", ep_cfg->ep_addr, ep_cfg->ep_mps, ep_cfg->ep_type);
 
 	if (ep_idx > USBD_IN_EP8_IDX) {
 		LOG_ERR("Endpoint index %d is out of range.", ep_idx);
@@ -993,7 +1081,7 @@ int usb_dc_ep_configure(const struct usb_dc_ep_cfg_data *const ep_cfg)
 	if (!ep_ctx) {
 		return -EINVAL;
 	}
-	LOG_INF("ep_addr: 0x%02x, ep_type:%d, ep_mps:%d", ep_cfg->ep_addr, ep_cfg->ep_type,
+	LOG_DBG("ep_addr: 0x%02x, ep_type:%d, ep_mps:%d", ep_cfg->ep_addr, ep_cfg->ep_type,
 		ep_cfg->ep_mps);
 	if (ep_idx == USBD_EP0_IDX) {
 		if (ep_cfg->ep_type != USB_DC_EP_CONTROL) {
@@ -1041,8 +1129,8 @@ int usb_dc_ep_configure(const struct usb_dc_ep_cfg_data *const ep_cfg)
 	ep_buf_init(ep_cfg->ep_addr);
 	ep_ctx->cfg.addr = ep_cfg->ep_addr;
 	ep_ctx->cfg.type = ep_cfg->ep_type;
-	if ((ep_ctx->cfg.type == USB_DC_EP_INTERRUPT) && USB_EP_DIR_IS_IN(ep_ctx->cfg.addr)) {
-		get_usbd_ctx()->irq_in_ep_bits |= ep_en_bit[ep_idx];
+	if ((ep_ctx->cfg.type == USB_DC_EP_BULK) && USB_EP_DIR_IS_OUT(ep_ctx->cfg.addr)) {
+		usbhw_data_ep_ack(ep_idx);
 	}
 
 	return 0;
@@ -1176,6 +1264,9 @@ int usb_dc_ep_enable(const uint8_t ep)
 		ep_ctx->cfg.stall = 0;
 		usbhw_set_ep_en(ep_en_bit[USB_EP_GET_IDX(ep)], 1);
 	}
+	if ((ep_ctx->cfg.type == USB_DC_EP_BULK) && USB_EP_DIR_IS_OUT(ep_ctx->cfg.addr)) {
+		usbhw_data_ep_ack(USB_EP_GET_IDX(ep));
+	}
 	return 0;
 }
 
@@ -1288,13 +1379,13 @@ int usb_dc_ep_write(const uint8_t ep, const uint8_t *const data, const uint32_t 
 		return -EINVAL;
 	}
 	LOG_HEXDUMP_DBG(data, data_len, "");
-
 	memcpy(ep_ctx->buf.data, data, data_len);
-	ep_ctx->buf.curr = ep_ctx->buf.data;
+	ep_ctx->buf.current_pos = ep_ctx->buf.data;
 	ep_ctx->buf.total_len = data_len;
 	ep_ctx->buf.left_len = data_len;
 	ep_ctx->cfg.stall = 0;
-	ep_write(ep, ep_ctx->buf.curr, ep_ctx->buf.left_len);
+	*ret_bytes = data_len;
+	ep_write(ep, ep_ctx->buf.current_pos, ep_ctx->buf.left_len);
 	return 0;
 }
 
@@ -1322,7 +1413,7 @@ int usb_dc_ep_read(const uint8_t ep, uint8_t *const data, const uint32_t max_dat
 {
 	int ret;
 
-	LOG_DBG("ep_read: ep 0x%02x, maxlen %d", ep, max_data_len);
+	LOG_DBG("dc_ep_read: ep 0x%02x, maxlen %d", ep, max_data_len);
 	ret = usb_dc_ep_read_wait(ep, data, max_data_len, read_bytes);
 
 	if (ret) {
@@ -1420,14 +1511,20 @@ int usb_dc_ep_read_wait(uint8_t ep, uint8_t *data, uint32_t max_data_len, uint32
 	k_mutex_lock(&ctx->drv_lock, K_FOREVER);
 
 	if (USB_EP_GET_IDX(ep) == USBD_EP0_IDX) {
-		bytes_to_copy = MIN(max_data_len, sizeof(struct usb_setup_packet));
-		memcpy(data, &ctx->setup, bytes_to_copy);
-	} else { // todo
-		LOG_ERR("Reading from endpoint %d needs to be done.", USB_EP_GET_IDX(ep));
-		return ENOSYS;
+		if (ep_ctx->reading) {
+			ep_ctx->reading = false;
+			bytes_to_copy = MIN(max_data_len, ep_ctx->buf.total_len);
+			memcpy(data, ep_ctx->buf.data, bytes_to_copy);
+		} else {
+			bytes_to_copy = MIN(max_data_len, sizeof(struct usb_setup_packet));
+			memcpy(data, &ctx->setup, bytes_to_copy);
+		}
+	} else {
+		bytes_to_copy = MIN(max_data_len, ep_ctx->buf.total_len);
+		memcpy(data, ep_ctx->buf.data, bytes_to_copy);
 	}
 	k_mutex_unlock(&ctx->drv_lock);
-
+	*read_bytes = bytes_to_copy;
 	LOG_HEXDUMP_DBG(data, bytes_to_copy, "");
 	return 0;
 }
@@ -1469,9 +1566,9 @@ int usb_dc_ep_read_continue(uint8_t ep)
 	LOG_DBG("Continue reading data from the Endpoint 0x%02x", ep);
 
 	if (USB_EP_GET_IDX(ep) == USBD_EP0_IDX) {
-		usbhw_write_ctrl_ep_ctrl(FLD_EP_STA_ACK);
+		usbhw_write_ctrl_ep_ctrl(FLD_EP_DAT_ACK);
 	} else {
-		reg_usb_ep_ctrl(USB_EP_GET_IDX(ep)) = FLD_EP_STA_ACK;
+		usbhw_data_ep_ack(USB_EP_GET_IDX(ep));
 	}
 	return 0;
 }
@@ -1513,10 +1610,41 @@ int usb_dc_wakeup_request(void)
 	return 0;
 }
 
+static void ep_read(usbd_endpoint_index_e ep_idx)
+{
+	uint8_t i;
+	uint8_t len;
+	struct b91_usbd_ep_ctx *ep_ctx;
+	struct b91_usbd_ctx *ctx = get_usbd_ctx();
+
+	if ((ep_idx != USBD_OUT_EP5_IDX) && (ep_idx != USBD_OUT_EP6_IDX)) {
+		LOG_ERR("EP%d is only for IN.", ep_idx);
+		return;
+	}
+
+	k_mutex_lock(&ctx->drv_lock, K_FOREVER);
+	len = reg_usb_ep_ptr(ep_idx);
+	ep_ctx = endpoint_ctx(USB_EP_GET_ADDR(ep_idx, USB_EP_DIR_OUT));
+	usbhw_reset_ep_ptr(ep_idx);
+
+	if (len && len <= ep_ctx->cfg.max_sz) {
+		for (i = 0; i < len; i++) {
+			ep_ctx->buf.data[i] = reg_usb_ep_dat(ep_idx);
+		}
+		ep_ctx->buf.left_len = ep_ctx->buf.total_len = len;
+		if (ep_ctx->cfg.cb) {
+			ep_ctx->cfg.cb(ep_ctx->cfg.addr, USB_DC_EP_DATA_OUT);
+		}
+	}
+	k_mutex_unlock(&ctx->drv_lock);
+	return;
+}
+
 static void usbd_work_handler(struct k_work *item)
 {
 	struct b91_usbd_ctx *ctx;
 	struct usbd_event *ev;
+
 	ctx = CONTAINER_OF(item, struct b91_usbd_ctx, usb_work);
 	while ((ev = usbd_evt_get()) != NULL) {
 		if (!dev_ready()) {
@@ -1524,11 +1652,32 @@ static void usbd_work_handler(struct k_work *item)
 			LOG_DBG("USBD is not ready, event drops.");
 			continue;
 		}
-		LOG_DBG("evt_type:%d", ev->evt_type);
 
 		switch (ev->evt_type) {
-		case USBD_EVT_EP:
-			LOG_DBG("USBD_EVT_EP");
+		case USBD_EVT_IRQ_EP:
+			LOG_DBG("USBD_EVT_IRQ_EP");
+			if (ev->ep_bits & FLD_USB_EDP5_IRQ) {
+				ep_read(USBD_OUT_EP5_IDX);
+			}
+			if (ev->ep_bits & FLD_USB_EDP6_IRQ) {
+				ep_read(USBD_OUT_EP6_IDX);
+			}
+			break;
+
+		case USBD_EVT_EP_COMPLETE:
+			LOG_DBG("USBD_EVT_EP_COMPLETE");
+			struct b91_usbd_ep_ctx *ep_ctx;
+			if ((ev->ep_idx == USBD_OUT_EP5_IDX) || (ev->ep_idx == USBD_OUT_EP6_IDX)) {
+				ep_ctx = endpoint_ctx(USB_EP_GET_ADDR(ev->ep_idx, USB_EP_DIR_OUT));
+				if (ep_ctx->cfg.cb) {
+					ep_ctx->cfg.cb(ep_ctx->cfg.addr, USB_DC_EP_DATA_OUT);
+				}
+			} else {
+				ep_ctx = endpoint_ctx(USB_EP_GET_ADDR(ev->ep_idx, USB_EP_DIR_IN));
+				if (ep_ctx->cfg.cb) {
+					ep_ctx->cfg.cb(ep_ctx->cfg.addr, USB_DC_EP_DATA_IN);
+				}
+			}
 			break;
 
 		case USBD_EVT_DATA:
