@@ -437,16 +437,21 @@ static void submit_usbd_event(enum usbd_event_type evt_type, uint8_t value)
  *
  * @details Reset the internal logic state for a given endpoint.
  *
- * @param[in]  ep_cts   Endpoint structure control block
+ * @param[in]  ep_idx   Endpoint number
  */
-static void ep_ctx_reset(struct b91_usbd_ep_ctx *ep_ctx)
+static void ep_ctx_reset(usbd_endpoint_index_e ep_idx)
 {
-	uint8_t ep_idx = USB_EP_GET_IDX(ep_ctx->cfg.addr);
+	struct b91_usbd_ep_ctx *ep_ctx;
 
 	if (ep_idx == USBD_EP0_IDX) {
 		usbhw_reset_ctrl_ep_ptr();
 	} else {
 		reg_usb_ep_ptr(ep_idx) = 0;
+	}
+	if ((ep_idx == USBD_OUT_EP5_IDX) || (ep_idx == USBD_OUT_EP6_IDX)) {
+		ep_ctx = out_endpoint_ctx(ep_idx);
+	} else {
+		ep_ctx = in_endpoint_ctx(ep_idx);
 	}
 	ep_ctx->buf.current_pos = ep_ctx->buf.data;
 	ep_ctx->buf.total_len = 0;
@@ -831,7 +836,6 @@ static void usb_irq_suspend(void)
 int usb_dc_attach(void)
 {
 	struct b91_usbd_ctx *ctx = get_usbd_ctx();
-	struct b91_usbd_ep_ctx *ep_ctx;
 	uint32_t i;
 
 	if (ctx->attached) {
@@ -841,12 +845,8 @@ int usb_dc_attach(void)
 	k_mutex_init(&ctx->drv_lock);
 
 	for (i = USBD_IN_EP1_IDX; i <= USBD_EP_IN_OUT_CNT; i++) {
-		if ((i == USBD_OUT_EP5_IDX) || (i == USBD_OUT_EP6_IDX)) {
-			ep_ctx = out_endpoint_ctx(i);
-		} else {
-			ep_ctx = in_endpoint_ctx(i);
-		}
-		ep_ctx_reset(ep_ctx);
+		usbhw_set_ep_en(ep_en_bit[i], 0);
+		ep_ctx_reset(i);
 	}
 
 	IRQ_CONNECT(USBD_B91_IRQN_BY_IDX(0), USBD_B91_IRQ_PRIORITY_BY_IDX(0), usb_irq_setup, 0, 0);
@@ -903,8 +903,6 @@ int usb_dc_attach(void)
 
 	usbhw_enable_manual_interrupt(FLD_CTRL_EP_AUTO_STD | FLD_CTRL_EP_AUTO_DESC |
 				      FLD_CTRL_EP_AUTO_CFG);
-	usbhw_set_eps_en(FLD_USB_EDP8_EN | FLD_USB_EDP1_EN | FLD_USB_EDP2_EN | FLD_USB_EDP3_EN |
-			 FLD_USB_EDP4_EN | FLD_USB_EDP5_EN | FLD_USB_EDP6_EN | FLD_USB_EDP7_EN);
 	core_interrupt_enable();
 	usbhw_set_irq_mask(USB_IRQ_RESET_MASK | USB_IRQ_SUSPEND_MASK);
 
@@ -1301,7 +1299,7 @@ int usb_dc_ep_disable(const uint8_t ep)
 
 	LOG_DBG("EP disable: 0x%02x", ep);
 	usbhw_set_ep_en(ep_en_bit[USB_EP_GET_IDX(ep)], 0);
-	ep_ctx_reset(ep_ctx);
+	ep_ctx_reset(USB_EP_GET_IDX(ep));
 	ep_ctx->cfg.stall = 1;
 	ep_ctx->cfg.en = false;
 	return 0;
