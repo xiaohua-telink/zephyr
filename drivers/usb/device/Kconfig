@@ -168,7 +168,7 @@ config USB_B91_EVT_QUEUE_SIZE
 	default 32
 	depends on USB_TELINK_B91
 	help
-	  Size of the internal event queue.
+	  Size of the driver's internal event queue.
 	  Required size will depend on number of endpoints (class instances) in use.
 
 config USB_B91_WORK_QUEUE_STACK_SIZE

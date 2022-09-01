@@ -482,6 +482,7 @@ static int ep_write(uint8_t ep, uint8_t *data, uint32_t data_len)
 	uint8_t ep_idx = USB_EP_GET_IDX(ep);
 	struct b91_usbd_ctx *ctx = get_usbd_ctx();
 	struct b91_usbd_ep_ctx *ep_ctx = endpoint_ctx(ep);
+
 	k_mutex_lock(&ctx->drv_lock, K_FOREVER);
 	if (ep_idx == USBD_EP0_IDX) {
 		if (data_len > 8) {
@@ -571,7 +572,6 @@ static void usb_irq_setup_handler(void)
 	ep_ctx->cfg.cb(USB_EP_GET_ADDR(USBD_EP0_IDX, USB_EP_DIR_OUT), USB_DC_EP_SETUP);
 
 	if (ep_ctx->cfg.stall) {
-		ep_ctx->cfg.stall = 0;
 		usbhw_write_ctrl_ep_ctrl(FLD_EP_DAT_STALL);
 	} else {
 		usbhw_write_ctrl_ep_ctrl(FLD_EP_DAT_ACK);
@@ -622,7 +622,8 @@ static void usb_ctrl_data_read_handler(void)
 static void usb_ctrl_data_write_handler(void)
 {
 	struct b91_usbd_ctx *ctx = get_usbd_ctx();
-	struct b91_usbd_ep_ctx *ep_ctx = endpoint_ctx(0);
+	struct b91_usbd_ep_ctx *ep_ctx =
+		endpoint_ctx(USB_EP_GET_ADDR(USBD_EP0_IDX, USB_EP_DIR_OUT));
 
 	reg_usb_sups_cyc_cali = CTRL_EP_NORMAL_PACKET_REG_VALUE;
 	usbhw_reset_ctrl_ep_ptr();
@@ -643,24 +644,20 @@ static void usb_ctrl_data_write_handler(void)
 static void usb_irq_data_handler(void)
 {
 	struct b91_usbd_ctx *ctx = get_usbd_ctx();
-	struct b91_usbd_ep_ctx *ep_ctx = endpoint_ctx(0);
 
 	if (!IS_REQUESTTYPE_DEV_TO_HOST(ctx->setup.bmRequestType)) {
 		usb_ctrl_data_read_handler();
 		return;
 	}
 
-	if ((ep_ctx->buf.total_len % 8 != 0) && !ep_ctx->buf.left_len) {
-		return;
-	}
 	usb_ctrl_data_write_handler();
 }
 
 static void usb_irq_status_handler(void)
 {
 	reg_usb_sups_cyc_cali = CTRL_EP_NORMAL_PACKET_REG_VALUE;
-	if (endpoint_ctx(0)->cfg.stall) {
-		usbhw_write_ctrl_ep_ctrl(FLD_EP_STA_STALL);
+	if (endpoint_ctx(USB_EP_GET_ADDR(USBD_EP0_IDX, USB_EP_DIR_OUT))->cfg.stall) {
+		endpoint_ctx(USB_EP_GET_ADDR(USBD_EP0_IDX, USB_EP_DIR_OUT))->cfg.stall = 0;
 	} else {
 		usbhw_write_ctrl_ep_ctrl(FLD_EP_STA_ACK);
 	}
