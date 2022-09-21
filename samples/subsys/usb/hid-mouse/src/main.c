@@ -151,7 +151,7 @@ static void x_move(const struct device *gpio, struct gpio_callback *cb,
 	if (def_val[2] != (uint8_t)ret) {
 		state += 10U;
 	}
-	
+
 	if (status[MOUSE_X_REPORT_POS] != state) {
 		status[MOUSE_X_REPORT_POS] = state;
 		k_sem_give(&sem);
@@ -174,7 +174,7 @@ static void y_move(const struct device *gpio, struct gpio_callback *cb,
 	if (def_val[3] != (uint8_t)ret) {
 		state += 10U;
 	}
-	
+
 	if (status[MOUSE_Y_REPORT_POS] != state) {
 		status[MOUSE_Y_REPORT_POS] = state;
 		k_sem_give(&sem);
