@@ -31,6 +31,10 @@ config NUM_IRQS
 	int
 	default 64
 
+config 2ND_LVL_ISR_TBL_OFFSET
+	int
+	default 12
+
 config PINCTRL
 	default y
 
