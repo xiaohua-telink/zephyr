@@ -129,7 +129,7 @@ manifest:
       groups:
         - hal
     - name: hal_telink
-      revision: 38573af589173259801ae6c2b34b7d4c9e626746
+      revision: a7e012b8f04ef8951b38f3b839ce64f2e70276bb
       path: modules/hal/telink
       submodules: true
       groups:

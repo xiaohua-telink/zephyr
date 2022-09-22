@@ -50,15 +50,15 @@ static const uint8_t ep_en_bit[] = {0,
 #define USB_OUT_EDP_IRQ_BITS (FLD_USB_EDP5_IRQ | FLD_USB_EDP6_IRQ)
 
 typedef enum {
-	USBD_EP0_IDX = 0,     // only for control transfer
-	USBD_IN_EP1_IDX = 1,  // only IN
-	USBD_IN_EP2_IDX = 2,  // only IN
-	USBD_IN_EP3_IDX = 3,  // only IN
-	USBD_IN_EP4_IDX = 4,  // only IN
-	USBD_OUT_EP5_IDX = 5, // only OUT
-	USBD_OUT_EP6_IDX = 6, // only OUT
-	USBD_IN_EP7_IDX = 7,  // only IN
-	USBD_IN_EP8_IDX = 8,  // only IN
+	USBD_EP0_IDX = 0,     /* only for control transfer */
+	USBD_IN_EP1_IDX = 1,  /* only IN */
+	USBD_IN_EP2_IDX = 2,  /* only IN */
+	USBD_IN_EP3_IDX = 3,  /* only IN */
+	USBD_IN_EP4_IDX = 4,  /* only IN */
+	USBD_OUT_EP5_IDX = 5, /* only OUT */
+	USBD_OUT_EP6_IDX = 6, /* only OUT */
+	USBD_IN_EP7_IDX = 7,  /* only IN */
+	USBD_IN_EP8_IDX = 8,  /* only IN */
 } usbd_endpoint_index_e;
 
 usbd_endpoint_index_e endpoint_in_idx[] = {USBD_IN_EP1_IDX, USBD_IN_EP2_IDX, USBD_IN_EP3_IDX,
@@ -199,8 +199,8 @@ struct b91_usbd_ctx {
 #define USB_FIFO_SIZE 128
 
 static uint8_t usb_fifo[USB_FIFO_NUM][USB_FIFO_SIZE];
-static uint8_t usb_ff_rptr = 0;
-static uint8_t usb_ff_wptr = 0;
+static uint8_t usb_ff_rptr;
+static uint8_t usb_ff_wptr;
 
 static struct b91_usbd_ctx usbd_ctx = {
 	.attached = false,
@@ -309,7 +309,7 @@ enum usbd_event_type {
 	USBD_EVT_RESET,
 	USBD_EVT_SUSPEND,
 	USBD_EVT_SLEEP,
-	USBD_EVT_FF // event for ep write data fifo
+	USBD_EVT_FF  /* event for ep write data fifo */
 };
 
 struct usbd_mem_block {
@@ -503,13 +503,13 @@ static int ep_write(uint8_t ep, uint8_t *data, uint32_t data_len)
 		if (usbhw_is_ep_busy(ep_idx)) {
 			LOG_DBG("EP%d is BUSY.", ep_idx);
 			uint8_t *p = (uint8_t *)&usb_fifo[usb_ff_wptr++ & (USB_FIFO_NUM - 1)];
-			p[0] = ep;	 // endpoint address
-			p[1] = data_len; // data length
+			p[0] = ep;	 /* endpoint address */
+			p[1] = data_len; /* data length */
 			memcpy(p + 2, data, data_len);
 
 			int fifo_use = (usb_ff_wptr - usb_ff_rptr) & (USB_FIFO_NUM * 2 - 1);
 			if (fifo_use > USB_FIFO_NUM) {
-				usb_ff_rptr++; // fifo overflows
+				usb_ff_rptr++; /* fifo overflows */
 			}
 			k_mutex_unlock(&ctx->drv_lock);
 			submit_usbd_event(USBD_EVT_FF, 0);
