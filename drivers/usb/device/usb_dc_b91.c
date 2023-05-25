@@ -297,13 +297,6 @@ static inline void usbd_work_schedule(void)
 	k_work_submit_to_queue(&usbd_work_queue, &(get_usbd_ctx()->usb_work));
 }
 
-enum usbd_ep_event_type {
-	EP_EVT_SETUP_RECV,
-	EP_EVT_RECV_REQ,
-	EP_EVT_RECV_COMPLETE,
-	EP_EVT_WRITE_COMPLETE,
-};
-
 enum usbd_event_type {
 	USBD_EVT_IRQ_EP,
 	USBD_EVT_EP_BUSY,
