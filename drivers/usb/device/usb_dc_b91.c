@@ -306,7 +306,6 @@ enum usbd_ep_event_type {
 
 enum usbd_event_type {
 	USBD_EVT_IRQ_EP,
-	USBD_EVT_EP_COMPLETE,
 	USBD_EVT_EP_BUSY,
 	USBD_EVT_REINIT,
 	USBD_EVT_SETUP,
@@ -428,8 +427,6 @@ static void submit_usbd_event(enum usbd_event_type evt_type, uint8_t value)
 
 	if (ev->evt_type == USBD_EVT_IRQ_EP) {
 		ev->ep_bits = value;
-	} else if (ev->evt_type == USBD_EVT_EP_COMPLETE) {
-		ev->ep_idx = value;
 	} else if (ev->evt_type == USBD_EVT_EP_BUSY) {
 		ev->ep_idx = value;
 	}
@@ -526,7 +523,6 @@ static uint32_t ep_write(uint8_t ep, const uint8_t *data, uint32_t data_len)
 			}
 			ep_ctx->writing_len = valid_len;
 			usbhw_data_ep_ack(ep_idx);
-			submit_usbd_event(USBD_EVT_EP_COMPLETE, ep_idx);
 		}
 	}
 	k_mutex_unlock(&ctx->drv_lock);
@@ -775,7 +771,6 @@ static inline void irq_out_eps_handler(uint8_t out_eps)
 
 	LOG_DBG("out_eps: 0x%02X", out_eps);
 	usbhw_clr_eps_irq(out_eps);
-	submit_usbd_event(USBD_EVT_IRQ_EP, out_eps);
 }
 
 static void usb_irq_eps(void)
@@ -784,6 +779,7 @@ static void usb_irq_eps(void)
 
 	irq_in_eps_handler(irq_eps & USB_IN_EDP_IRQ_BITS);
 	irq_out_eps_handler(irq_eps & USB_OUT_EDP_IRQ_BITS);
+	submit_usbd_event(USBD_EVT_IRQ_EP, irq_eps);
 }
 
 static void usb_irq_reset(void)
@@ -1593,7 +1589,23 @@ int usb_dc_wakeup_request(void)
 	return 0;
 }
 
-static void ep_read(enum usbd_endpoint_index_e ep_idx)
+static void evt_irq_in_ep_handler(enum usbd_endpoint_index_e ep_idx)
+{
+	struct b91_usbd_ep_ctx *ep_ctx;
+
+	if ((ep_idx == USBD_OUT_EP5_IDX) || (ep_idx == USBD_OUT_EP6_IDX)) {
+		LOG_ERR("EP%d is only for OUT.", ep_idx);
+		return;
+	}
+
+    ep_ctx = endpoint_ctx(USB_EP_GET_ADDR(ep_idx, USBD_EP_DIR_IN));
+
+    if (ep_ctx->cfg.cb) {
+        ep_ctx->cfg.cb(ep_ctx->cfg.addr, USB_DC_EP_DATA_IN);
+    }
+}
+
+static void evt_irq_out_ep_handler(enum usbd_endpoint_index_e ep_idx)
 {
 	uint8_t i;
 	uint8_t len;
@@ -1639,26 +1651,29 @@ static void usbd_work_handler(struct k_work *item)
 		switch (ev->evt_type) {
 		case USBD_EVT_IRQ_EP:
 			LOG_DBG("USBD_EVT_IRQ_EP");
+			if (ev->ep_bits & FLD_USB_EDP1_IRQ) {
+				evt_irq_in_ep_handler(USBD_IN_EP1_IDX);
+			}
+			if (ev->ep_bits & FLD_USB_EDP2_IRQ) {
+				evt_irq_in_ep_handler(USBD_IN_EP2_IDX);
+			}
+			if (ev->ep_bits & FLD_USB_EDP3_IRQ) {
+				evt_irq_in_ep_handler(USBD_IN_EP3_IDX);
+			}
+			if (ev->ep_bits & FLD_USB_EDP4_IRQ) {
+				evt_irq_in_ep_handler(USBD_IN_EP4_IDX);
+			}
+			if (ev->ep_bits & FLD_USB_EDP7_IRQ) {
+				evt_irq_in_ep_handler(USBD_IN_EP7_IDX);
+			}
+			if (ev->ep_bits & FLD_USB_EDP8_IRQ) {
+				evt_irq_in_ep_handler(USBD_IN_EP8_IDX);
+			}
 			if (ev->ep_bits & FLD_USB_EDP5_IRQ) {
-				ep_read(USBD_OUT_EP5_IDX);
+				evt_irq_out_ep_handler(USBD_OUT_EP5_IDX);
 			}
 			if (ev->ep_bits & FLD_USB_EDP6_IRQ) {
-				ep_read(USBD_OUT_EP6_IDX);
-			}
-			break;
-
-		case USBD_EVT_EP_COMPLETE:
-			LOG_DBG("USBD_EVT_EP_COMPLETE");
-			if ((ev->ep_idx == USBD_OUT_EP5_IDX) || (ev->ep_idx == USBD_OUT_EP6_IDX)) {
-				ep_ctx = endpoint_ctx(USB_EP_GET_ADDR(ev->ep_idx, USB_EP_DIR_OUT));
-				if (ep_ctx->cfg.cb) {
-					ep_ctx->cfg.cb(ep_ctx->cfg.addr, USB_DC_EP_DATA_OUT);
-				}
-			} else {
-				ep_ctx = endpoint_ctx(USB_EP_GET_ADDR(ev->ep_idx, USB_EP_DIR_IN));
-				if (ep_ctx->cfg.cb) {
-					ep_ctx->cfg.cb(ep_ctx->cfg.addr, USB_DC_EP_DATA_IN);
-				}
+				evt_irq_out_ep_handler(USBD_OUT_EP6_IDX);
 			}
 			break;
 
