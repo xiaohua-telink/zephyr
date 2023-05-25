@@ -1610,14 +1610,12 @@ static void evt_irq_out_ep_handler(enum usbd_endpoint_index_e ep_idx)
 	uint8_t i;
 	uint8_t len;
 	struct b91_usbd_ep_ctx *ep_ctx;
-	struct b91_usbd_ctx *ctx = get_usbd_ctx();
 
 	if ((ep_idx != USBD_OUT_EP5_IDX) && (ep_idx != USBD_OUT_EP6_IDX)) {
 		LOG_ERR("EP%d is only for IN.", ep_idx);
 		return;
 	}
 
-	k_mutex_lock(&ctx->drv_lock, K_FOREVER);
 	len = reg_usb_ep_ptr(ep_idx);
 	ep_ctx = endpoint_ctx(USB_EP_GET_ADDR(ep_idx, USB_EP_DIR_OUT));
 	usbhw_reset_ep_ptr(ep_idx);
@@ -1631,7 +1629,6 @@ static void evt_irq_out_ep_handler(enum usbd_endpoint_index_e ep_idx)
 			ep_ctx->cfg.cb(ep_ctx->cfg.addr, USB_DC_EP_DATA_OUT);
 		}
 	}
-	k_mutex_unlock(&ctx->drv_lock);
 }
 
 static void usbd_work_handler(struct k_work *item)
